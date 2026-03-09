@@ -31,7 +31,9 @@ import java.util.List;
 
 public class ClassInformer extends GhidraScript {
 
-
+    // -----------------------------------------------------------------------
+    // State
+    // -----------------------------------------------------------------------
     private boolean is64bit;
     private int     ptrSize;
     private long    imageBase;
@@ -112,6 +114,9 @@ public class ClassInformer extends GhidraScript {
         SwingUtilities.invokeLater(this::showGui);
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 1 – single memory sweep
+    // -----------------------------------------------------------------------
     private void sweepMemory() throws Exception {
         Memory mem = currentProgram.getMemory();
 
@@ -159,7 +164,9 @@ public class ClassInformer extends GhidraScript {
         }
     }
 
-
+    // -----------------------------------------------------------------------
+    // Phase 2 – find COLs and vftables
+    // -----------------------------------------------------------------------
     private void findCOLsAndVftables() throws Exception {
         for (Map.Entry<Long, String> tdEntry : tdToName.entrySet()) {
             if (monitor.isCancelled()) break;
@@ -249,7 +256,9 @@ public class ClassInformer extends GhidraScript {
         } catch (Exception e) { return false; }
     }
 
-
+    // -----------------------------------------------------------------------
+    // Phase 3 – class hierarchy
+    // -----------------------------------------------------------------------
     private void parseHierarchy(COLInfo col) {
         try {
             Memory mem = currentProgram.getMemory();
@@ -292,7 +301,9 @@ public class ClassInformer extends GhidraScript {
         } catch (Exception ignored) {}
     }
 
- 
+    // -----------------------------------------------------------------------
+    // Phase 4 – labels & types
+    // -----------------------------------------------------------------------
     private void applyLabelsAndStructures() throws Exception {
         for (Map.Entry<Long, String> e : tdToName.entrySet()) {
             Address a = rawAddr(e.getKey());
@@ -316,7 +327,9 @@ public class ClassInformer extends GhidraScript {
         }
     }
 
-   
+    // -----------------------------------------------------------------------
+    // Count vftable entries
+    // -----------------------------------------------------------------------
     private int countVftableEntries(String addrStr) {
         try {
             long base = Long.parseUnsignedLong(addrStr.replace("0x", ""), 16);
@@ -337,7 +350,9 @@ public class ClassInformer extends GhidraScript {
         } catch (Exception e) { return 0; }
     }
 
-
+    // -----------------------------------------------------------------------
+    // GUI – uses Ghidra/system Look & Feel, no forced dark colours
+    // -----------------------------------------------------------------------
     private void showGui() {
         // Use whatever L&F Ghidra already has installed — don't override it
         JFrame frame = new JFrame("ClassInformer  \u2014  " + currentProgram.getName());
@@ -616,13 +631,14 @@ public class ClassInformer extends GhidraScript {
         if (table.getRowCount() > 0) table.setRowSelectionInterval(0, 0);
     }
 
-
+    // -----------------------------------------------------------------------
+    // Hierarchy
+    // -----------------------------------------------------------------------
     private String buildHierarchyText(String cls) {
         StringBuilder sb = new StringBuilder();
         buildTree(cls, 0, sb, new HashSet<>());
         return sb.toString();
     }
-
     private void buildTree(String cls, int depth, StringBuilder sb, Set<String> seen) {
         if (seen.contains(cls)) return;
         seen.add(cls);
@@ -632,20 +648,23 @@ public class ClassInformer extends GhidraScript {
             buildTree(base, depth + 1, sb, seen);
     }
 
-
+    // -----------------------------------------------------------------------
+    // Clipboard helpers
+    // -----------------------------------------------------------------------
     private void copyCell(JTable table, DefaultTableModel model, int col) {
         int vr = table.getSelectedRow();
         if (vr < 0) return;
         copyToClipboard(String.valueOf(model.getValueAt(table.convertRowIndexToModel(vr), col)));
     }
-
     private void copyToClipboard(String text) {
         java.awt.datatransfer.StringSelection sel =
                 new java.awt.datatransfer.StringSelection(text);
         Toolkit.getDefaultToolkit().getSystemClipboard().setContents(sel, sel);
     }
 
-    
+    // -----------------------------------------------------------------------
+    // Data types
+    // -----------------------------------------------------------------------
     private void applyTypeDescriptorType(Address addr) {
         try {
             Structure s = getOrMakeStruct("RTTI_TypeDescriptor", () -> {
@@ -658,7 +677,6 @@ public class ClassInformer extends GhidraScript {
             currentProgram.getListing().createData(addr, s);
         } catch (Exception ignored) {}
     }
-
     private void applyCOLDataType(Address addr) {
         try {
             String nm = is64bit ? "RTTI_COL64" : "RTTI_COL32";
@@ -680,7 +698,6 @@ public class ClassInformer extends GhidraScript {
             currentProgram.getListing().createData(addr, s);
         } catch (Exception ignored) {}
     }
-
     @FunctionalInterface interface SF { Structure create(); }
     private Structure getOrMakeStruct(String name, SF f) {
         Structure e = (Structure) dtm.getDataType("/" + name);
@@ -688,53 +705,70 @@ public class ClassInformer extends GhidraScript {
         return (Structure) dtm.addDataType(f.create(), DataTypeConflictHandler.KEEP_HANDLER);
     }
 
-    
+    // -----------------------------------------------------------------------
+    // Memory helpers
+    // -----------------------------------------------------------------------
     private long readBufPtr(ByteBuffer buf, int off) {
         return is64bit ? buf.getLong(off) : buf.getInt(off) & 0xFFFFFFFFL;
     }
-
     private int readInt32At(long offset) throws Exception {
         Address a = rawAddr(offset);
         if (a == null) return 0;
         return currentProgram.getMemory().getInt(a);
     }
-
     private Address rawAddr(long offset) {
         try {
             return currentProgram.getAddressFactory()
                     .getDefaultAddressSpace().getAddress(offset);
         } catch (Exception e) { return null; }
     }
-
     private boolean isValidAbsAddr(long val) {
         if (val == 0) return false;
         Address a = rawAddr(val);
         return a != null && currentProgram.getMemory().contains(a);
     }
-
     private String extractName(byte[] bytes, int off) {
         StringBuilder sb = new StringBuilder();
-        for (int i = off; i < bytes.length && bytes[i] != 0; i++)
-            sb.append((char)(bytes[i] & 0xFF));
+        for (int i = off; i < bytes.length; i++) {
+            byte b = bytes[i];
+            if (b == 0) break;                       // null terminator
+            char c = (char)(b & 0xFF);
+            // Stop at any non-printable / non-ASCII byte — these are garbage padding
+            if (c < 0x20 || c > 0x7E) break;
+            sb.append(c);
+        }
         String m = sb.toString();
-        if (m.length() > 4 && m.startsWith(".?A")) m = m.substring(4);
+        // Strip MSVC mangling prefix: .?AV (class), .?AU (struct), .?A (other)
+        if (m.startsWith(".?AV") || m.startsWith(".?AU")) m = m.substring(4);
+        else if (m.startsWith(".?A")) m = m.substring(3);
+        // Strip trailing @@
         if (m.endsWith("@@")) m = m.substring(0, m.length() - 2);
+        // Replace @@ namespace separator with ::
         m = m.replace("@@", "::");
+        // Strip any remaining non-printable characters
+        m = m.replaceAll("[^\\x20-\\x7E:_<>~*&]", "");
         return m.isEmpty() ? "Unknown" : m;
+    }
+
+    /** Strip characters Ghidra rejects in symbol / namespace names */
+    private static String sanitizeSymbolPart(String s) {
+        // Keep letters, digits, _ < > ~ * & . (template params common in MSVC names)
+        return s.replaceAll("[^A-Za-z0-9_<>~*&. ]", "_").trim();
     }
 
     private Namespace getOrCreateNamespace(String name) throws Exception {
         Namespace cur = currentProgram.getGlobalNamespace();
         for (String part : name.split("::")) {
             if (part.isEmpty()) continue;
-            Namespace ex = currentProgram.getSymbolTable().getNamespace(part, cur);
+            String safePart = sanitizeSymbolPart(part);
+            if (safePart.isEmpty()) continue;
+            Namespace ex = currentProgram.getSymbolTable().getNamespace(safePart, cur);
             cur = (ex != null) ? ex
                     : currentProgram.getSymbolTable()
-                            .createNameSpace(cur, part, SourceType.ANALYSIS);
+                            .createNameSpace(cur, safePart, SourceType.ANALYSIS);
         }
         return cur;
     }
-
     private void safeLabel(Address addr, String name, Namespace ns) {
         try {
             Symbol sym = currentProgram.getSymbolTable().getPrimarySymbol(addr);
